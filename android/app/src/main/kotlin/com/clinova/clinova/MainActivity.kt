@@ -1,0 +1,5 @@
+package com.clinova.clinova
+
+import io.flutter.embedding.android.FlutterActivity
+
+class MainActivity : FlutterActivity()

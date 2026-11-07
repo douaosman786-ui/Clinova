@@ -1,0 +1,250 @@
+rules_version = '2';
+
+// =============================================================================
+//  CLINOVA — Règles de sécurité Cloud Firestore
+//  Plan Spark (gratuit) : pas de Cloud Function. Ces règles sont la barrière
+//  serveur : elles revalident chaque réservation / annulation / report écrit
+//  par l'application dans une transaction atomique.
+//  Rôles : patient, doctor, receptionist, admin.
+//  Heure de la clinique : Djibouti (UTC+3). Vendredi : fermé.
+// =============================================================================
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------------------------------------------------------------- helpers
+    function signedIn() { return request.auth != null; }
+    function userPath(uid) { return /databases/$(database)/documents/users/$(uid); }
+    function hasProfile() { return signedIn() && exists(userPath(request.auth.uid)); }
+    function me() { return get(userPath(request.auth.uid)).data; }
+    function active() { return hasProfile() && me().isActive == true; }
+    function isAdmin() { return active() && me().role == 'admin'; }
+    function isReceptionist() { return active() && me().role == 'receptionist'; }
+    function isStaff() { return active() && me().role in ['admin', 'receptionist']; }
+    function isDoctor() { return active() && me().role == 'doctor'; }
+    function isPatient() { return active() && me().role == 'patient'; }
+    function changedOnly(keys) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys);
+    }
+    function validRole(r) { return r in ['patient', 'doctor', 'receptionist', 'admin']; }
+
+    // Vérification serveur d'un créneau (UC5 / UC8 / FR14) :
+    // futur, aligné sur 30 min, durée 30 min, pas un vendredi (heure clinique),
+    // médecin actif, entièrement dans une plage horaire du médecin,
+    // réservation déterministe doctorId_startMillis écrite dans la même transaction.
+    function slotIsValid(d, apptId) {
+      let startMs = d.startAt.toMillis();
+      let localMs = startMs + 10800000;                       // UTC+3
+      let weekday = ((math.floor(localMs / 86400000) + 3) % 7) + 1; // 1 = lundi … 7 = dimanche
+      let minuteOfDay = math.floor((localMs % 86400000) / 60000);
+      let sched = get(/databases/$(database)/documents/doctorSchedules/$(d.scheduleId)).data;
+      let doctor = get(/databases/$(database)/documents/doctors/$(d.doctorId)).data;
+      let rid = d.doctorId + '_' + string(startMs);
+      return d.startAt > request.time
+        && d.endAt.toMillis() == startMs + 1800000
+        && startMs % 1800000 == 0
+        && weekday != 5
+        && doctor.isActive == true
+        && sched.doctorId == d.doctorId
+        && sched.isAvailable == true
+        && sched.dayOfWeek == weekday
+        && minuteOfDay >= sched.startMinutes
+        && minuteOfDay + 30 <= sched.endMinutes
+        && d.reservationId == rid
+        && getAfter(/databases/$(database)/documents/slotReservations/$(rid)).data.appointmentId == apptId;
+    }
+
+    // ------------------------------------------------------- config/bootstrap
+    match /config/{docId} {
+      allow get: if docId == 'bootstrap';
+      allow list: if false;
+      // Premier lancement : le créateur devient l'unique administrateur initial.
+      allow create: if docId == 'bootstrap'
+        && signedIn()
+        && request.resource.data.adminUid == request.auth.uid
+        && getAfter(userPath(request.auth.uid)).data.role == 'admin';
+      allow update: if docId == 'bootstrap' && isAdmin() && changedOnly(['showDemoLogins']);
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------- users
+    match /users/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
+
+      allow create: if signedIn() && (
+        // UC1 : un patient crée son propre profil (rôle Patient uniquement)
+        (request.auth.uid == uid
+          && request.resource.data.uid == uid
+          && request.resource.data.role == 'patient'
+          && request.resource.data.isActive == true
+          && request.resource.data.patientId == uid
+          && !('doctorId' in request.resource.data))
+        // Premier administrateur (initialisation unique)
+        || (request.auth.uid == uid
+          && request.resource.data.role == 'admin'
+          && request.resource.data.isActive == true
+          && !exists(/databases/$(database)/documents/config/bootstrap)
+          && getAfter(/databases/$(database)/documents/config/bootstrap).data.adminUid == uid)
+        // UC15 : l'administrateur crée tout type de compte
+        || (isAdmin() && request.auth.uid != uid && validRole(request.resource.data.role))
+        // UC9 / UC10 : la réception crée des comptes patient ou médecin
+        || (isReceptionist() && request.auth.uid != uid
+          && request.resource.data.role in ['patient', 'doctor']
+          && request.resource.data.isActive == true)
+      );
+
+      allow update: if signedIn() && (
+        // Chacun peut modifier son nom, téléphone et langue — jamais son rôle ni son statut
+        (request.auth.uid == uid && changedOnly(['fullName', 'phone', 'language', 'updatedAt']))
+        // L'administrateur gère les autres comptes (rôle, activation)
+        || (isAdmin() && request.auth.uid != uid && validRole(request.resource.data.role))
+        // La réception met à jour les coordonnées des patients / médecins
+        || (isReceptionist() && request.auth.uid != uid
+          && resource.data.role in ['patient', 'doctor']
+          && changedOnly(['fullName', 'phone', 'updatedAt']))
+      );
+
+      allow delete: if false;
+    }
+
+    // ------------------------------------------------------------- patients
+    match /patients/{patientId} {
+      allow read: if isStaff() || (signedIn() && resource.data.userUid == request.auth.uid);
+
+      allow create: if isStaff()
+        || (signedIn() && patientId == request.auth.uid
+          && request.resource.data.userUid == request.auth.uid
+          && request.resource.data.patientId == patientId);
+
+      allow update: if isStaff()
+        || (signedIn() && resource.data.userUid == request.auth.uid
+          && changedOnly(['fullName', 'phone', 'dateOfBirth', 'updatedAt']));
+
+      allow delete: if false;
+    }
+
+    // -------------------------------------------------------------- doctors
+    match /doctors/{doctorId} {
+      allow read: if active();
+      allow create, update: if isStaff()
+        && request.resource.data.fullName is string
+        && request.resource.data.specialization is string
+        && request.resource.data.isActive is bool;
+      allow delete: if false;
+    }
+
+    // ------------------------------------------------------ doctorSchedules
+    // UC16 / FR14 : seul l'administrateur configure les horaires.
+    match /doctorSchedules/{scheduleId} {
+      allow read: if active();
+      allow create, update: if isAdmin()
+        && request.resource.data.doctorId is string
+        && request.resource.data.dayOfWeek in [1, 2, 3, 4, 6, 7]
+        && request.resource.data.startMinutes is int
+        && request.resource.data.endMinutes is int
+        && request.resource.data.startMinutes >= 0
+        && request.resource.data.endMinutes <= 1440
+        && request.resource.data.startMinutes < request.resource.data.endMinutes
+        && request.resource.data.startMinutes % 30 == 0
+        && request.resource.data.endMinutes % 30 == 0
+        && request.resource.data.isAvailable is bool;
+      allow delete: if isAdmin();
+    }
+
+    // --------------------------------------------------------- appointments
+    match /appointments/{apptId} {
+      allow read: if isStaff()
+        || (isPatient() && resource.data.patientUid == request.auth.uid)
+        || (isDoctor() && resource.data.doctorId == me().doctorId);
+
+      // UC5 — bookAtomically()
+      allow create: if active()
+        && request.resource.data.appointmentId == apptId
+        && request.resource.data.status == 'Scheduled'
+        && request.resource.data.bookedByUid == request.auth.uid
+        && exists(/databases/$(database)/documents/patients/$(request.resource.data.patientId))
+        && (isStaff()
+          || (isPatient()
+            && request.resource.data.patientId == request.auth.uid
+            && request.resource.data.patientUid == request.auth.uid))
+        && request.resource.data.get('doctorUid', null)
+             == get(/databases/$(database)/documents/doctors/$(request.resource.data.doctorId)).data.get('userUid', null)
+        && slotIsValid(request.resource.data, apptId);
+
+      allow update: if active() && (
+        // UC7 — cancelAtomically() : statut Cancelled + réservation supprimée dans la même transaction
+        (resource.data.status == 'Scheduled'
+          && request.resource.data.status == 'Cancelled'
+          && request.resource.data.cancelledByUid == request.auth.uid
+          && changedOnly(['status', 'cancelledAt', 'cancelledByUid', 'updatedAt'])
+          && !existsAfter(/databases/$(database)/documents/slotReservations/$(resource.data.reservationId))
+          && (isStaff()
+            || (isPatient() && resource.data.patientUid == request.auth.uid
+              && resource.data.startAt > request.time)))
+        // UC8 — rescheduleAtomically() : nouveau créneau réservé + ancien libéré atomiquement
+        || (resource.data.status == 'Scheduled'
+          && request.resource.data.status == 'Scheduled'
+          && changedOnly(['startAt', 'endAt', 'scheduleId', 'reservationId', 'updatedAt'])
+          && request.resource.data.doctorId == resource.data.doctorId
+          && request.resource.data.reservationId != resource.data.reservationId
+          && !existsAfter(/databases/$(database)/documents/slotReservations/$(resource.data.reservationId))
+          && (isStaff()
+            || (isPatient() && resource.data.patientUid == request.auth.uid
+              && resource.data.startAt > request.time))
+          && slotIsValid(request.resource.data, apptId))
+        // UC13 — markCompleted()
+        || (resource.data.status == 'Scheduled'
+          && request.resource.data.status == 'Completed'
+          && request.resource.data.completedByUid == request.auth.uid
+          && changedOnly(['status', 'completedAt', 'completedByUid', 'updatedAt'])
+          && (isStaff() || (isDoctor() && resource.data.doctorId == me().doctorId)))
+      );
+
+      allow delete: if false;
+    }
+
+    // -------------------------------------------------------- notifications
+    // Notifications in-app écrites dans la même transaction que le rendez-vous.
+    // Destinataire = patient ou médecin du rendez-vous ; auteur = personne
+    // autorisée à agir sur ce rendez-vous. Seul le destinataire peut lire.
+    function canNotifyAbout(n) {
+      let appt = getAfter(/databases/$(database)/documents/appointments/$(n.appointmentId)).data;
+      return (n.recipientUid == appt.get('patientUid', '') || n.recipientUid == appt.get('doctorUid', ''))
+        && (isStaff()
+          || appt.get('patientUid', '') == request.auth.uid
+          || (isDoctor() && appt.doctorId == me().doctorId));
+    }
+
+    match /notifications/{notifId} {
+      allow read: if signedIn() && resource.data.recipientUid == request.auth.uid;
+      allow create: if active()
+        && request.resource.data.actorUid == request.auth.uid
+        && request.resource.data.recipientUid is string
+        && request.resource.data.recipientUid != request.auth.uid
+        && request.resource.data.read == false
+        && request.resource.data.type in ['booked', 'rescheduled', 'cancelled', 'completed']
+        && canNotifyAbout(request.resource.data);
+      allow update: if signedIn() && resource.data.recipientUid == request.auth.uid && changedOnly(['read']);
+      allow delete: if signedIn() && resource.data.recipientUid == request.auth.uid;
+    }
+
+    // ------------------------------------------------------ slotReservations
+    // Clé déterministe doctorId_startMillis : un seul rendez-vous actif par
+    // médecin et par heure. Création / suppression uniquement avec la mise à
+    // jour du rendez-vous correspondant (même transaction).
+    match /slotReservations/{rid} {
+      allow read: if active();
+
+      allow create: if active()
+        && rid == request.resource.data.doctorId + '_' + string(request.resource.data.startAt.toMillis())
+        && getAfter(/databases/$(database)/documents/appointments/$(request.resource.data.appointmentId)).data.reservationId == rid
+        && getAfter(/databases/$(database)/documents/appointments/$(request.resource.data.appointmentId)).data.status == 'Scheduled';
+
+      allow delete: if active() && (
+        getAfter(/databases/$(database)/documents/appointments/$(resource.data.appointmentId)).data.status == 'Cancelled'
+        || getAfter(/databases/$(database)/documents/appointments/$(resource.data.appointmentId)).data.reservationId != rid
+      );
+
+      allow update: if false;
+    }
+  }
+}

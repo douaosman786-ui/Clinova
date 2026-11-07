@@ -1,0 +1,11 @@
+analyzer:
+  exclude:
+    - build/**
+    - android/**
+    - web/**
+  errors:
+    unused_import: warning
+linter:
+  rules:
+    - avoid_print
+    - prefer_const_constructors_in_immutables

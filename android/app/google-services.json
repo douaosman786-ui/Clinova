@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "213929240423",
+    "project_id": "clinova-app",
+    "storage_bucket": "clinova-app.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:213929240423:android:35474ed5423cb7851eb1c2",
+        "android_client_info": {
+          "package_name": "com.clinova.clinova"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBNfBEL-FL1yPplmpjtT9h-9uqxcn9Vhbk"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
